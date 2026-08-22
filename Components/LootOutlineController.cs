@@ -75,10 +75,21 @@ namespace LootOutline.Components
         private float    _mainEquipBuiltAt = -999f;
         private const float MainEquipRefreshSeconds = 2f;
 
-        // Containers are map-static — scanned once, with a throttled retry while
-        // the world is still populating.
+        // Containers are map-static — scanned with a throttled retry while the
+        // world populates, then re-scanned slowly: FindObjectsOfType only returns
+        // ACTIVE objects, so containers in rooms EFT had culling-disabled at scan
+        // time would otherwise be missing for the whole raid.
         private float _containerCacheTryTime = -999f;
         private const float ContainerCacheRetrySeconds = 5f;
+        private const float ContainerRescanSeconds = 60f;
+
+        // Per-container has-loot TTL cache. The GetAllItems walk allocates and
+        // runs per in-range container per pass; contents only change on looting,
+        // so 2s of staleness is invisible. Cleared on world reset.
+        private struct ContainerLoot { public bool Has; public float At; }
+        private readonly Dictionary<int, ContainerLoot> _containerLootCache
+            = new Dictionary<int, ContainerLoot>();
+        private const float ContainerLootTtlSeconds = 2f;
 
         // One renderer's mesh + how to position it. Static meshes keep a live
         // Transform (animated lids still track); SkinnedMeshRenderers go through
@@ -132,12 +143,14 @@ namespace LootOutline.Components
         }
         private readonly Queue<PendingCache> _cacheQueue = new Queue<PendingCache>();
         private readonly HashSet<int>        _pendingCacheIds = new HashSet<int>();
-        // Instance IDs whose CollectRenderers returned zero entries — don't re-scan
-        // them every tick. Bodies are excluded (a ragdoll can transiently have no
-        // usable SMRs right after death) and use the timed backoff below instead.
-        private readonly HashSet<int>        _failedCacheIds  = new HashSet<int>();
-        private readonly Dictionary<int, float> _bodyFailRetryAt = new Dictionary<int, float>();
+        // Failed cache builds retry on a timed backoff — NEVER a permanent
+        // blacklist. A build can transiently return 0 entries while a ragdoll is
+        // still initialising, or while EFT's room culling has the object's
+        // renderers deactivated for the current player position. Bodies retry
+        // fast; items/containers slower (genuinely renderer-less prefabs exist).
+        private readonly Dictionary<int, float> _failRetryAt = new Dictionary<int, float>();
         private const float BodyFailRetrySeconds = 1f;
+        private const float ItemFailRetrySeconds = 5f;
 
         // Per-corpse equipped-item-ID cache. The deep loadout walk (GetAllItems)
         // allocates, and a dead body's loadout only changes when looted, so it's
@@ -147,8 +160,10 @@ namespace LootOutline.Components
         private const float CorpseEquipRefreshSeconds = 5f;
         private readonly List<string> _equipScratch = new List<string>();
         private Coroutine _cacheCoroutine;
-        // Per-frame time budget for the cache-build coroutine.
-        private const float CacheBudgetSeconds = 0.001f;
+        // Per-frame time budget for the cache-build coroutine. 3ms: entering a
+        // dense loot area outlines within a few frames while staying well under
+        // a 60fps frame budget.
+        private const float CacheBudgetSeconds = 0.003f;
 
         // What to draw this tick (rebuilt every slow tick, consumed every frame).
         // Occlusion is per-pixel in the shader, so there's no per-object LOS state to
@@ -167,6 +182,8 @@ namespace LootOutline.Components
         // bosses) from RegisteredPlayers shortly after death, so the live list
         // misses their corpses.
         private readonly HashSet<Player> _seenPlayers = new HashSet<Player>();
+        // Unity fake-null: a destroyed Player compares == null.
+        private static readonly Predicate<Player> _destroyedPlayer = p => p == null;
         // Dead-player positions this pass, used to suppress weapons that fell
         // with the ragdoll (they'd overlap the body outline).
         private readonly List<Vector3> _deadBodyPositions = new List<Vector3>();
@@ -201,7 +218,14 @@ namespace LootOutline.Components
         private BuildPhase _buildPhase = BuildPhase.Idle;
         private int   _buildCursor;
         private float _lastPassStartTime = -999f;
-        private const float PassIntervalSeconds = 0.5f;
+        private const float PassIntervalSeconds = 0.25f;
+        // Set by the cache coroutine when it finishes building entries a pass
+        // requested; lets the next pass start as soon as the queue drains instead
+        // of waiting out the full interval (new loot appears without the lag).
+        // The floor keeps early passes from running back-to-back while walking
+        // through dense loot (each pass discovers more, builds, retriggers).
+        private bool _cacheBuiltSincePass;
+        private const float EarlyPassMinSeconds = 0.1f;
         // Per-frame slice sizes; items dominate scene-wide so they get the most.
         private const int ItemsPerFrame      = 192;
         private const int ContainersPerFrame = 48;
@@ -413,8 +437,13 @@ namespace LootOutline.Components
             {
                 case BuildPhase.Idle:
                     // Cadence measured from the previous pass START, so a long pass
-                    // rolls straight into the next.
-                    if (Time.realtimeSinceStartup - _lastPassStartTime >= PassIntervalSeconds)
+                    // rolls straight into the next. A drained cache queue with fresh
+                    // builds short-circuits the interval — newly cached objects get
+                    // drawn on the very next pass instead of waiting it out.
+                    float sincePass = Time.realtimeSinceStartup - _lastPassStartTime;
+                    if (sincePass >= PassIntervalSeconds ||
+                        (sincePass >= EarlyPassMinSeconds &&
+                         _cacheBuiltSincePass && _cacheQueue.Count == 0))
                         BeginPass(gameWorld);
                     break;
                 case BuildPhase.Items:      StepItemsPhase();      break;
@@ -429,6 +458,7 @@ namespace LootOutline.Components
         private void BeginPass(GameWorld gameWorld)
         {
             _lastPassStartTime = Time.realtimeSinceStartup;
+            _cacheBuiltSincePass = false;
 
             _passPlayerPos = gameWorld.MainPlayer.Transform.position;
             _passRange     = Plugin.DetectionRange.Value;
@@ -442,6 +472,10 @@ namespace LootOutline.Components
             _passCamPos = _attachedCam != null
                 ? _attachedCam.transform.position
                 : (_mainCam != null ? _mainCam.transform.position : _passPlayerPos + Vector3.up * 1.7f);
+
+            // Drop destroyed Player refs (despawned corpses) so the seen set
+            // doesn't accumulate across a long raid.
+            _seenPlayers.RemoveWhere(_destroyedPlayer);
 
             // Fresh accumulation for this pass.
             _playerTransforms.Clear();
@@ -467,7 +501,7 @@ namespace LootOutline.Components
                 foreach (var p in allPlayers)
                 {
                     if (ReferenceEquals(p, gameWorld.MainPlayer)) continue;
-                    AddPlayerToScratch(p, deepEquipped: false);
+                    AddPlayerToScratch(p);
                     // SPT drops some bots from RegisteredPlayers after death;
                     // keep the reference so the corpse stays outlinable.
                     if (p is Player pl) _seenPlayers.Add(pl);
@@ -548,15 +582,22 @@ namespace LootOutline.Components
                 }
             }
 
-            // Container cache: map-static, scanned until it returns non-empty.
-            if (Plugin.OutlineContainers.Value && _containerCache.Length == 0 &&
-                Time.realtimeSinceStartup - _containerCacheTryTime >= ContainerCacheRetrySeconds)
+            // Container cache: fast retry while empty, then a slow re-scan that
+            // only ever grows the snapshot (a scan taken while EFT has more rooms
+            // culled would otherwise shrink it).
+            if (Plugin.OutlineContainers.Value)
             {
-                _containerCache = FindObjectsOfType<LootableContainer>();
-                _containerCacheTryTime = Time.realtimeSinceStartup;
+                float nowC = Time.realtimeSinceStartup;
+                float cadence = _containerCache.Length == 0
+                    ? ContainerCacheRetrySeconds
+                    : ContainerRescanSeconds;
+                if (nowC - _containerCacheTryTime >= cadence)
+                {
+                    var scan = FindObjectsOfType<LootableContainer>();
+                    if (scan.Length > _containerCache.Length) _containerCache = scan;
+                    _containerCacheTryTime = nowC;
+                }
             }
-
-            if (!_useShader) _drawList.Clear();
 
             _diagInRange = _diagOwned = _diagQueued = 0;
             _buildCursor = 0;
@@ -582,7 +623,14 @@ namespace LootOutline.Components
                 if (dSqr > _passPrefilterSqr) continue;
                 // Within interaction range → you can already take it, so hide the
                 // outline. Only triggers when you're genuinely on top of the item.
-                if (_passInteractHideSqr > 0f && dSqr < _passInteractHideSqr) continue;
+                // Keep its renderer cache warm though — otherwise stepping up to
+                // an item prunes the cache and stepping back forces a full async
+                // rebuild (outline lags ~1s reappearing).
+                if (_passInteractHideSqr > 0f && dSqr < _passInteractHideSqr)
+                {
+                    _activeThisTick.Add(li.gameObject.GetInstanceID());
+                    continue;
+                }
                 _diagInRange++;
                 if (!HasResolvableItem(li)) continue;
                 if (IsOwnedByAnyPlayer(li, _playerTransforms, _equippedItemIds))
@@ -629,7 +677,10 @@ namespace LootOutline.Components
             {
                 var c = _containerCache[i];
                 if (c == null || c.gameObject == null) continue;
-                if (!c.gameObject.activeInHierarchy) continue;
+                // NO activeInHierarchy skip: EFT's baked room culling deactivates
+                // prop GOs by player position (conservative around fences/grates),
+                // but we draw cached meshes ourselves — a culled container keeps
+                // its outline (bounds fall back to the cached AABB).
                 if ((c.transform.position - _passPlayerPos).sqrMagnitude > _passPrefilterSqr) continue;
                 // Skip container spawn points with no loot. EFT can have an
                 // initialized ItemOwner with an empty grid, so a null check isn't
@@ -737,17 +788,12 @@ namespace LootOutline.Components
                 _rendererCache.Remove(id);
             }
 
-            _staleIds.Clear();
-            foreach (var id in _failedCacheIds)
-                if (!_activeThisTick.Contains(id)) _staleIds.Add(id);
-            foreach (var id in _staleIds) _failedCacheIds.Remove(id);
-
-            // Body retry-backoff and corpse equip caches: same lifetime rule, so the
+            // Retry-backoff and corpse equip caches: same lifetime rule, so the
             // dictionaries don't accumulate across a raid.
             _staleIds.Clear();
-            foreach (var id in _bodyFailRetryAt.Keys)
+            foreach (var id in _failRetryAt.Keys)
                 if (!_activeThisTick.Contains(id)) _staleIds.Add(id);
-            foreach (var id in _staleIds) _bodyFailRetryAt.Remove(id);
+            foreach (var id in _staleIds) _failRetryAt.Remove(id);
 
             _staleIds.Clear();
             foreach (var id in _corpseEquipCache.Keys)
@@ -782,14 +828,14 @@ namespace LootOutline.Components
             _activeThisTick.Clear();
             _cacheQueue.Clear();
             _pendingCacheIds.Clear();
-            _failedCacheIds.Clear();
-            _bodyFailRetryAt.Clear();
+            _failRetryAt.Clear();
             _corpseEquipCache.Clear();
             _seenPlayers.Clear();
             _seenSnapshot.Clear();
             _deadBodyPositions.Clear();
             _containerCache         = Array.Empty<LootableContainer>();
             _containerCacheTryTime  = -999f;
+            _containerLootCache.Clear();
             _lootItemCache          = Array.Empty<LootItem>();
             _lootItemCacheBuildTime = -999f;
             _lootItemsSnapshot.Clear();
@@ -807,6 +853,13 @@ namespace LootOutline.Components
                                   bool bodyOnly = false,
                                   Vector3? worldPosOverride = null)
         {
+            // Mark active BEFORE the range/held early-outs: everything inside the
+            // prefilter buffer keeps its cache warm, so an object hovering at the
+            // detection-range edge (or excluded as held) isn't pruned and
+            // async-rebuilt on every pass.
+            int id = go.GetInstanceID();
+            _activeThisTick.Add(id);
+
             // For dead bodies, go.transform.position is the player MonoBehaviour
             // transform — pinned at world origin in EFT, so the range check would
             // always fail. Caller supplies Player.Transform.position via the
@@ -817,18 +870,13 @@ namespace LootOutline.Components
                 Vector3.Distance(camPos, worldPos) < HeldItemExclusionRadius)
                 return;
 
-            int id = go.GetInstanceID();
-            _activeThisTick.Add(id);
-
             if (!_rendererCache.TryGetValue(id, out var cached))
             {
                 // Cache miss — enqueue for async build (appears within a few
-                // frames). Known-empty objects are skipped; bodies use a timed
-                // backoff so a transient ragdoll-init failure self-heals.
-                bool blocked = bodyOnly
-                    ? (_bodyFailRetryAt.TryGetValue(id, out float retryAt)
-                       && Time.realtimeSinceStartup < retryAt)
-                    : _failedCacheIds.Contains(id);
+                // frames). Recently-failed builds wait out their retry backoff
+                // so transient failures (ragdoll init, room culling) self-heal.
+                bool blocked = _failRetryAt.TryGetValue(id, out float retryAt)
+                            && Time.realtimeSinceStartup < retryAt;
                 if (!_pendingCacheIds.Contains(id) && !blocked)
                 {
                     _pendingCacheIds.Add(id);
@@ -930,8 +978,10 @@ namespace LootOutline.Components
             // LootableContainer trigger, so walk up a couple of prefab-root-ish
             // levels. Child-count/renderer caps keep the walk away from huge
             // scene-grouping nodes; a parent is only accepted if it actually
-            // contributes additional renderers.
-            if (expandToPrefabRoot && !bodyOnly)
+            // contributes additional renderers. NEVER expand from an inactive
+            // root: it contributes 0 renderers itself, so the walk would cache
+            // its SIBLINGS' meshes — a ghost outline around neighbouring props.
+            if (expandToPrefabRoot && !bodyOnly && go.activeInHierarchy)
             {
                 const int MaxParentChildren    = 12;
                 const int MaxWalkUpLevels      = 2;
@@ -1045,9 +1095,9 @@ namespace LootOutline.Components
         // Populates the pooled _playerTransforms / _equippedItemIds for one player.
         // Typed as `object` to avoid referencing IPlayer directly (drags in the
         // DissonanceVoip assembly); every IPlayer is a Player at runtime.
-        // deepEquipped recurses into nested mod/magazine items — needed only for
-        // the local player, whose mods can appear as separate world LootItems.
-        private void AddPlayerToScratch(object obj, bool deepEquipped)
+        // Top-level equipment IDs only — the deep nested-mod walk is only needed
+        // for the local player and corpses, via the TTL-cached CollectEquippedIds.
+        private void AddPlayerToScratch(object obj)
         {
             if (obj == null) return;
             var mb = obj as MonoBehaviour;
@@ -1067,18 +1117,7 @@ namespace LootOutline.Components
                 if (inv == null) return;
                 foreach (var top in inv.GetPlayerItems(EPlayerItems.Equipment))
                 {
-                    if (top == null) continue;
-                    if (top.Id != null) _equippedItemIds.Add(top.Id);
-                    if (!deepEquipped) continue;
-                    try
-                    {
-                        foreach (var child in top.GetAllItems())
-                        {
-                            if (child != null && child.Id != null)
-                                _equippedItemIds.Add(child.Id);
-                        }
-                    }
-                    catch { /* item type may not expose GetAllItems */ }
+                    if (top != null && top.Id != null) _equippedItemIds.Add(top.Id);
                 }
             }
             catch { /* defensive — transient Profile/Inventory null during spawn/respawn */ }
@@ -1193,7 +1232,20 @@ namespace LootOutline.Components
             return isCompound;
         }
 
-        private static bool ContainerHasLoot(LootableContainer c)
+        private bool ContainerHasLoot(LootableContainer c)
+        {
+            int id = c.gameObject.GetInstanceID();
+            float now = Time.realtimeSinceStartup;
+            if (_containerLootCache.TryGetValue(id, out var cl) &&
+                now - cl.At < ContainerLootTtlSeconds)
+                return cl.Has;
+
+            bool has = ComputeContainerHasLoot(c);
+            _containerLootCache[id] = new ContainerLoot { Has = has, At = now };
+            return has;
+        }
+
+        private static bool ComputeContainerHasLoot(LootableContainer c)
         {
             try
             {
@@ -1224,15 +1276,16 @@ namespace LootOutline.Components
         {
             if (_cmd == null) return;
             _cmd.Clear();
-            if (_drawObjects.Count == 0) return;
 
             var cam = _attachedCam;
             if (cam == null) return;
 
-            // "Line of Sight Check" toggles per-pixel depth occlusion (and gates the
-            // depth prepass) exactly as in the three-pass path.
+            // "Line of Sight Check" toggles per-pixel depth occlusion and gates the
+            // depth prepass. Applied before the empty-list early-out so switching
+            // LOS off releases the forced prepass even with nothing outlined.
             bool losOn = Plugin.LineOfSightCheck.Value;
-            if (_attachedCam != null) ApplyDepthMode(_attachedCam, losOn);
+            ApplyDepthMode(cam, losOn);
+            if (_drawObjects.Count == 0) return;
             float occl = losOn ? 1f : 0f;
 
             Vector3 camPos = cam.transform.position;
@@ -1310,7 +1363,7 @@ namespace LootOutline.Components
                 for (int i = 0; i < n; i++)
                 {
                     var e = d.Entries[i];
-                    if (e.Mesh == null) continue;
+                    if (e.Mesh == null || !EntryAlive(e)) continue;
                     int sc = e.Mesh.subMeshCount;
                     for (int s = 0; s < sc; s++)
                         _cmd.DrawMesh(e.Mesh, _matrixBuffer[i], _maskMat, s, 0, _mpb);
@@ -1365,6 +1418,9 @@ namespace LootOutline.Components
         {
             if (_cmd == null) return;
             _cmd.Clear();
+            // See the mask-edge path: depth mode follows the LOS toggle even when
+            // nothing is drawn.
+            ApplyDepthMode(_attachedCam, Plugin.LineOfSightCheck.Value);
             if (_drawObjects.Count == 0) return;
 
             // Convert outline width from screen pixels (config) to NDC units
@@ -1393,10 +1449,6 @@ namespace LootOutline.Components
             _contDrawMat.SetFloat("_DepthOcclude", losOn ? 1f : 0f);
             _bodyDrawMat.SetFloat("_DepthOcclude", losOn ? 1f : 0f);
             _bodyDrawMat.SetFloat("_DepthBias", Plugin.BodyDepthBias.Value);
-
-            // Only force depth-texture generation while occlusion is on (see
-            // ApplyDepthMode — a forced depth prepass isn't free).
-            if (_attachedCam != null) ApplyDepthMode(_attachedCam, losOn);
 
             int count = _drawObjects.Count;
             for (int oi = 0; oi < count; oi++)
@@ -1449,7 +1501,7 @@ namespace LootOutline.Components
                 for (int i = 0; i < n; i++)
                 {
                     var e = d.Entries[i];
-                    if (e.Mesh == null) continue;
+                    if (e.Mesh == null || !EntryAlive(e)) continue;
                     int sc = e.Mesh.subMeshCount;
                     for (int s = 0; s < sc; s++) _cmd.DrawMesh(e.Mesh, _matrixBuffer[i], stencilMat, s, 0);
                 }
@@ -1457,7 +1509,7 @@ namespace LootOutline.Components
                 for (int i = 0; i < n; i++)
                 {
                     var e = d.Entries[i];
-                    if (e.Mesh == null) continue;
+                    if (e.Mesh == null || !EntryAlive(e)) continue;
                     int sc = e.Mesh.subMeshCount;
                     for (int s = 0; s < sc; s++) _cmd.DrawMesh(e.Mesh, _matrixBuffer[i], drawMat, s, 0, _mpb);
                 }
@@ -1465,7 +1517,7 @@ namespace LootOutline.Components
                 for (int i = 0; i < n; i++)
                 {
                     var e = d.Entries[i];
-                    if (e.Mesh == null) continue;
+                    if (e.Mesh == null || !EntryAlive(e)) continue;
                     int sc = e.Mesh.subMeshCount;
                     for (int s = 0; s < sc; s++) _cmd.DrawMesh(e.Mesh, _matrixBuffer[i], clearMat, s, 0);
                 }
@@ -1556,19 +1608,19 @@ namespace LootOutline.Components
                     if (rd.Entries.Length > 0)
                     {
                         _rendererCache[req.InstanceId] = rd;
-                        // A later successful build clears any pending body backoff.
-                        if (req.BodyOnly) _bodyFailRetryAt.Remove(req.InstanceId);
-                    }
-                    else if (req.BodyOnly)
-                    {
-                        // Transient corpse failure — back off and retry, don't
-                        // blacklist (the ragdoll may still be initialising).
-                        _bodyFailRetryAt[req.InstanceId] =
-                            Time.realtimeSinceStartup + BodyFailRetrySeconds;
+                        // A later successful build clears any pending backoff.
+                        _failRetryAt.Remove(req.InstanceId);
+                        // Let the builder state machine start the next pass early
+                        // so this object gets drawn without waiting the interval.
+                        _cacheBuiltSincePass = true;
                     }
                     else
                     {
-                        _failedCacheIds.Add(req.InstanceId);
+                        // Transient failure — back off and retry (ragdoll still
+                        // initialising, or EFT room culling has the renderers
+                        // deactivated from the current position).
+                        _failRetryAt[req.InstanceId] = Time.realtimeSinceStartup
+                            + (req.BodyOnly ? BodyFailRetrySeconds : ItemFailRetrySeconds);
                         // Debug log, once per unique item name.
                         if (Plugin.DebugLogging.Value
                             && !req.BodyOnly && !req.ExpandToPrefabRoot
@@ -1593,6 +1645,18 @@ namespace LootOutline.Components
         // renderer and EFT's per-any-camera occlusion culling, both of which go
         // false while an object is plainly on screen. Per-pixel GPU occlusion +
         // the frustum test are the visibility authorities.
+
+        // Draw gate for STATIC entries: the cached renderer must actually be
+        // rendering. EFT hides unspawned container variants by disabling the
+        // Renderer COMPONENT on a still-active GO — includeInactive=false never
+        // filtered those, and drawing them makes ghost outlines at empty spawn
+        // points. Deliberately checks enabled/active, NOT isVisible (isVisible
+        // goes false on plainly-visible objects; see the note below).
+        private static bool EntryAlive(in MeshEntry e)
+        {
+            var r = e.Rend;
+            return r == null || (r.enabled && r.gameObject.activeInHierarchy);
+        }
 
         // Current world-AABB from each entry's live renderer. Skips disabled/
         // inactive entries (filters a container's animated lid swap, tracks
@@ -1626,7 +1690,9 @@ namespace LootOutline.Components
             _contMat.SetColor("_OutlineColor", Plugin.ContainerOutlineColor.Value);
             _contMat.SetFloat("_OutlineWidth", w);
 
-            var cam = _attachedCam;
+            // No CommandBuffer on this path, so _attachedCam is never set — cull
+            // against the resolved FPS camera instead.
+            var cam = _mainCam;
             if (cam == null) return;
             Vector3 camPos = cam.transform.position;
             Vector3 camFwd = cam.transform.forward;
@@ -1646,7 +1712,7 @@ namespace LootOutline.Components
                 var mat = d.IsContainer ? _contMat : _itemMat;
                 foreach (var e in d.Entries)
                 {
-                    if (e.Mesh == null) continue;
+                    if (e.Mesh == null || !EntryAlive(e)) continue;
                     Matrix4x4 m = e.Tx != null
                         ? e.Tx.localToWorldMatrix * e.LocalOffset
                         : e.FixedMatrix;
@@ -1748,7 +1814,10 @@ namespace LootOutline.Components
         {
             if (_useShader) return;
             if (!Plugin.Enabled.Value || _lineMat == null || _drawList.Count == 0) return;
-            if (Camera.current == null || Camera.current != Camera.main) return;
+            // Camera.main can be a wide environment camera in EFT — prefer the
+            // resolved FPS camera when we have one.
+            var fpsCam = _mainCam != null ? _mainCam : Camera.main;
+            if (Camera.current == null || Camera.current != fpsCam) return;
 
             _lineMat.SetPass(0);
             GL.PushMatrix();
@@ -1783,7 +1852,7 @@ namespace LootOutline.Components
             if (_cacheCoroutine != null) { StopCoroutine(_cacheCoroutine); _cacheCoroutine = null; }
             _cacheQueue.Clear();
             _pendingCacheIds.Clear();
-            _failedCacheIds.Clear();
+            _failRetryAt.Clear();
 
             DetachCommandBuffer();
             if (_cmd != null) { _cmd.Release(); _cmd = null; }

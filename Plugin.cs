@@ -45,7 +45,7 @@ namespace LootOutline
 
             Enabled               = Config.Bind("General", "Enabled",             true,  "Enable loot outline highlighting");
             OutlineLooseItems     = Config.Bind("General", "Outline Loose Items", true,  "Highlight loose loot items lying on the ground");
-            OutlineContainers     = Config.Bind("General", "Outline Containers",  true,  "Highlight lootable containers (crates, bags, etc.)");
+            OutlineContainers     = Config.Bind("General", "Outline Containers",  true,  "Highlight lootable containers (crates, bags, etc.) and dead bodies");
             ItemOutlineColor      = Config.Bind("Visuals", "Item Color",          new Color(1f, 1f, 1f, 1f),        "Outline color for loose items");
             ContainerOutlineColor = Config.Bind("Visuals", "Container Color",     new Color(0.4f, 0.85f, 1f, 1f),   "Outline color for containers");
             OutlineWidth          = Config.Bind("Visuals", "Outline Width",       3f,
@@ -70,9 +70,12 @@ namespace LootOutline
 
             TryLoadShaderBundle();
 
-            LogSource.LogInfo(OutlineShader != null
-                ? "LootOutline loaded — using custom outline shader."
-                : "LootOutline loaded — shader bundle not found, using GL wireframe fallback.");
+            bool anyPipeline = (MaskShader != null && EdgeShader != null)
+                            || (StencilShader != null && DrawShader != null && ClearShader != null)
+                            || OutlineShader != null;
+            LogSource.LogInfo(anyPipeline
+                ? "LootOutline loaded — shader outline pipeline active."
+                : "LootOutline loaded — no usable shaders, using GL wireframe fallback.");
         }
 
         private void TryLoadShaderBundle()
