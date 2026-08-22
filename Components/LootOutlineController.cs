@@ -613,19 +613,30 @@ namespace LootOutline.Components
                 _buildPhase  = BuildPhase.Containers;
                 return;
             }
-
+        
             int end = Mathf.Min(_buildCursor + ItemsPerFrame, _lootItemsSnapshot.Count);
             for (int i = _buildCursor; i < end; i++)
             {
                 var li = _lootItemsSnapshot[i];
                 if (li == null || li.gameObject == null) continue;
+                
+                // Skip items that are not active or have no active renderers
+                if (!li.gameObject.activeInHierarchy)
+                {
+                    _activeThisTick.Add(li.gameObject.GetInstanceID());
+                    continue;
+                }
+        
+                // Check if there are any active renderers, if none, it's not spawned yet
+                var renderers = li.gameObject.GetComponentsInChildren<Renderer>(false);
+                if (renderers.Length == 0)
+                {
+                    _activeThisTick.Add(li.gameObject.GetInstanceID());
+                    continue;
+                }
+        
                 float dSqr = (li.transform.position - _passPlayerPos).sqrMagnitude;
                 if (dSqr > _passPrefilterSqr) continue;
-                // Within interaction range → you can already take it, so hide the
-                // outline. Only triggers when you're genuinely on top of the item.
-                // Keep its renderer cache warm though — otherwise stepping up to
-                // an item prunes the cache and stepping back forces a full async
-                // rebuild (outline lags ~1s reappearing).
                 if (_passInteractHideSqr > 0f && dSqr < _passInteractHideSqr)
                 {
                     _activeThisTick.Add(li.gameObject.GetInstanceID());
@@ -648,7 +659,7 @@ namespace LootOutline.Components
                              expandToPrefabRoot: false,
                              isContainer: false);
             }
-
+        
             _buildCursor = end;
             if (_buildCursor >= _lootItemsSnapshot.Count)
             {
