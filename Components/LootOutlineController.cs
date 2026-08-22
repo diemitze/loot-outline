@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using Comfort.Common;
 using EFT;
+using EFT.CameraControl;
 using EFT.Interactive;
 using EFT.InventoryLogic;
 using UnityEngine;
@@ -556,7 +557,7 @@ namespace LootOutline.Components
             {
                 _lootItemsSnapshot.Clear();
                 var lootRegistry = gameWorld.LootItems;
-                var registryList = lootRegistry != null ? lootRegistry.List_0 : null;
+                var registryList = lootRegistry != null ? lootRegistry._iteration : null;
                 if (registryList != null && registryList.Count > 0)
                 {
                     _lootItemsSnapshot.AddRange(registryList);
@@ -1734,14 +1735,14 @@ namespace LootOutline.Components
 
         // ── CommandBuffer attach/detach ────────────────────────────────────────────
 
-        // CameraClass.Instance.Camera is the real FPS camera; fall back to a name
+        // CameraManager.Instance.Camera is the real FPS camera; fall back to a name
         // lookup, then Camera.main. try/catch because Instance can be null during
         // scene load.
         private static Camera ResolveFpsCamera()
         {
             try
             {
-                var inst = CameraClass.Instance;
+                var inst = CameraManager.Instance;
                 if (inst != null && inst.Camera != null) return inst.Camera;
             }
             catch { }
